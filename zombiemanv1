@@ -1,0 +1,466 @@
+-- AimLock (LocalScript in StarterPlayer > StarterPlayerScripts)
+-- Lock-on / aim assist for your game.
+--   [N]  turn it on/off (small status text, bottom left)
+--   Hold RIGHT CLICK  -> the camera locks onto the player closest to your crosshair, inside the FOV circle
+--   [M]  open the menu: shrink/grow the FOV circle, lock strength, show the circle, wall check, team check
+-- It only moves YOUR camera. Nothing is sent to the server.
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ====================================================================
+-- ====== CONFIG (edit these) =========================================
+-- ====================================================================
+local TOGGLE_KEY = Enum.KeyCode.N              -- turns the aim lock on/off
+local MENU_KEY = Enum.KeyCode.M                -- opens/closes the settings menu
+local LOCK_BUTTON = Enum.UserInputType.MouseButton2 -- hold this to lock on (right click)
+local TARGET_PART = "Head"                     -- "Head" or "HumanoidRootPart" (chest)
+
+local FOV_MIN, FOV_MAX = 30, 500               -- FOV circle radius limits, in pixels
+
+-- starting values (you can change them in the menu while playing)
+local settings = {
+	enabled = false,
+	fov = 150,          -- radius of the FOV circle (pixels). Smaller = harder to lock
+	strength = 70,      -- 1-100. How hard the camera snaps onto the target
+	showCircle = true,  -- draw the FOV circle while the aim lock is on
+	wallCheck = true,   -- only lock onto players you can actually see
+	teamCheck = true,   -- ignore players on your own team
+}
+
+-- ====================================================================
+-- ====== STYLE (same look as the rest of your game) ==================
+-- ====================================================================
+local FONT = Enum.Font.FredokaOne
+local WHITE = Color3.new(1, 1, 1)
+local EDGE = Color3.fromRGB(4, 4, 7)
+local SILVER = Color3.fromRGB(195, 195, 206)
+local KEY_TOP = Color3.fromRGB(58, 58, 70)
+local KEY_BOTTOM = Color3.fromRGB(30, 30, 40)
+local GOLD = Color3.fromRGB(255, 214, 90)
+local GOLD_DARK = Color3.fromRGB(200, 140, 30)
+local GREEN = Color3.fromRGB(100, 230, 130)
+local POP = TweenInfo.new(0.32, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+local function addStroke(inst, thickness, mode, color)
+	local s = Instance.new("UIStroke")
+	s.ApplyStrokeMode = mode or Enum.ApplyStrokeMode.Contextual
+	s.Color = color or EDGE
+	s.Thickness = thickness
+	s.Parent = inst
+	return s
+end
+
+local function addCorner(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = inst
+	return c
+end
+
+local function styleText(label, size, color)
+	label.Font = FONT
+	label.TextSize = size
+	label.TextColor3 = color or WHITE
+	addStroke(label, math.max(1.5, size / 9), Enum.ApplyStrokeMode.Contextual)
+end
+
+local function setGradient(frame, top, bottom)
+	local g = frame:FindFirstChild("Fill")
+	if not g then
+		g = Instance.new("UIGradient")
+		g.Name = "Fill"
+		g.Rotation = 90
+		g.Parent = frame
+	end
+	g.Color = ColorSequence.new(top, bottom)
+end
+
+local function pop(obj, from)
+	local s = obj:FindFirstChild("PopScale")
+	if not s then
+		s = Instance.new("UIScale")
+		s.Name = "PopScale"
+		s.Parent = obj
+	end
+	s.Scale = from or 0.6
+	TweenService:Create(s, POP, { Scale = 1 }):Play()
+end
+
+local function newLabel(parent, text, size, color, xAlign)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.Size = UDim2.fromScale(1, 1)
+	l.TextXAlignment = xAlign or Enum.TextXAlignment.Center
+	l.Parent = parent
+	styleText(l, size, color)
+	return l
+end
+
+-- ====================================================================
+-- ====== GUI =========================================================
+-- ====================================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "AimLock"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 35
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+-- small status text, bottom left
+local status = Instance.new("TextLabel")
+status.Name = "Status"
+status.AnchorPoint = Vector2.new(0, 1)
+status.Position = UDim2.new(0, 20, 1, -64) -- sits just above the "[N] Note" chip
+status.Size = UDim2.fromOffset(240, 20)
+status.BackgroundTransparency = 1
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = gui
+styleText(status, 15, SILVER)
+
+-- FOV circle (centered on the crosshair)
+local circle = Instance.new("Frame")
+circle.Name = "FovCircle"
+circle.AnchorPoint = Vector2.new(0.5, 0.5)
+circle.Position = UDim2.fromScale(0.5, 0.5)
+circle.BackgroundTransparency = 1
+circle.BorderSizePixel = 0
+circle.Visible = false
+circle.Parent = gui
+addCorner(circle, 1000)
+local circleStroke = addStroke(circle, 2, Enum.ApplyStrokeMode.Border, WHITE)
+circleStroke.Transparency = 0.35
+
+-- ====================================================================
+-- ====== MENU ========================================================
+-- ====================================================================
+local menu = Instance.new("Frame")
+menu.Name = "Menu"
+menu.AnchorPoint = Vector2.new(0.5, 0.5)
+menu.Position = UDim2.fromScale(0.5, 0.5)
+menu.Size = UDim2.fromOffset(360, 372)
+menu.BackgroundColor3 = WHITE
+menu.BorderSizePixel = 0
+menu.Visible = false
+menu.Parent = gui
+addCorner(menu, 16)
+addStroke(menu, 3, Enum.ApplyStrokeMode.Border)
+setGradient(menu, KEY_TOP, KEY_BOTTOM)
+
+local menuTitle = Instance.new("TextLabel")
+menuTitle.BackgroundTransparency = 1
+menuTitle.Position = UDim2.new(0, 0, 0, 12)
+menuTitle.Size = UDim2.new(1, 0, 0, 30)
+menuTitle.Text = "AIM LOCK"
+menuTitle.Parent = menu
+styleText(menuTitle, 26)
+
+local content = Instance.new("Frame")
+content.BackgroundTransparency = 1
+content.Position = UDim2.new(0, 28, 0, 56)
+content.Size = UDim2.new(1, -56, 1, -96)
+content.Parent = menu
+local contentList = Instance.new("UIListLayout")
+contentList.Padding = UDim.new(0, 8)
+contentList.SortOrder = Enum.SortOrder.LayoutOrder
+contentList.Parent = content
+
+local menuHint = Instance.new("TextLabel")
+menuHint.AnchorPoint = Vector2.new(0.5, 1)
+menuHint.Position = UDim2.new(0.5, 0, 1, -10)
+menuHint.Size = UDim2.new(1, 0, 0, 20)
+menuHint.BackgroundTransparency = 1
+menuHint.Text = "[" .. MENU_KEY.Name .. "] Close"
+menuHint.Parent = menu
+styleText(menuHint, 15, SILVER)
+
+local renderers = {} -- everything that needs redrawing when a setting changes
+local function renderAll()
+	for _, fn in ipairs(renderers) do fn() end
+end
+
+local function updateCircle()
+	local d = settings.fov * 2
+	circle.Size = UDim2.fromOffset(d, d)
+	circle.Visible = settings.enabled and settings.showCircle
+end
+
+local function updateStatus()
+	status.Text = "[" .. TOGGLE_KEY.Name .. "] Aim Lock: " .. (settings.enabled and "ON" or "OFF")
+	status.TextColor3 = settings.enabled and GREEN or SILVER
+end
+
+local order = 0
+local function makeSlider(text, min, max, key, suffix)
+	order += 1
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 52)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+	row.Parent = content
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Size = UDim2.new(0.6, 0, 0, 20)
+	nameLabel.Text = text
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.Parent = row
+	styleText(nameLabel, 17)
+
+	local valueLabel = Instance.new("TextLabel")
+	valueLabel.BackgroundTransparency = 1
+	valueLabel.AnchorPoint = Vector2.new(1, 0)
+	valueLabel.Position = UDim2.new(1, 0, 0, 0)
+	valueLabel.Size = UDim2.new(0.4, 0, 0, 20)
+	valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+	valueLabel.Parent = row
+	styleText(valueLabel, 17, GOLD)
+
+	local track = Instance.new("Frame")
+	track.Position = UDim2.new(0, 0, 0, 32)
+	track.Size = UDim2.new(1, 0, 0, 10)
+	track.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+	track.BorderSizePixel = 0
+	track.Parent = row
+	addCorner(track, 5)
+	addStroke(track, 2, Enum.ApplyStrokeMode.Border)
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = WHITE
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.Parent = track
+	addCorner(fill, 5)
+	setGradient(fill, GOLD, GOLD_DARK)
+
+	local knob = Instance.new("Frame")
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Size = UDim2.fromOffset(18, 18)
+	knob.BackgroundColor3 = WHITE
+	knob.BorderSizePixel = 0
+	knob.ZIndex = 3
+	knob.Parent = track
+	addCorner(knob, 9)
+	addStroke(knob, 2, Enum.ApplyStrokeMode.Border)
+
+	local hit = Instance.new("TextButton") -- big invisible grab area
+	hit.BackgroundTransparency = 1
+	hit.Text = ""
+	hit.Position = UDim2.new(0, -8, 0, 22)
+	hit.Size = UDim2.new(1, 16, 0, 30)
+	hit.ZIndex = 4
+	hit.Parent = row
+
+	local function render()
+		local rel = (settings[key] - min) / (max - min)
+		fill.Size = UDim2.fromScale(rel, 1)
+		knob.Position = UDim2.fromScale(rel, 0.5)
+		valueLabel.Text = tostring(settings[key]) .. (suffix or "")
+	end
+	table.insert(renderers, render)
+
+	local dragging = false
+	local function setFromX(x)
+		local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		settings[key] = math.floor(min + rel * (max - min) + 0.5)
+		render()
+		updateCircle()
+	end
+
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	render()
+end
+
+local function makeToggle(text, key)
+	order += 1
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 34)
+	btn.LayoutOrder = order
+	btn.AutoButtonColor = false
+	btn.Text = ""
+	btn.BackgroundColor3 = WHITE
+	btn.BorderSizePixel = 0
+	btn.Parent = content
+	addCorner(btn, 10)
+	addStroke(btn, 2, Enum.ApplyStrokeMode.Border)
+	local label = newLabel(btn, "", 17)
+
+	local function render()
+		label.Text = text .. ": " .. (settings[key] and "ON" or "OFF")
+		if settings[key] then
+			setGradient(btn, Color3.fromRGB(90, 200, 120), Color3.fromRGB(45, 130, 75))
+		else
+			setGradient(btn, KEY_TOP, KEY_BOTTOM)
+		end
+	end
+	table.insert(renderers, render)
+
+	btn.Activated:Connect(function()
+		settings[key] = not settings[key]
+		render()
+		updateCircle()
+		updateStatus()
+	end)
+	render()
+end
+
+makeToggle("Aim Lock", "enabled")
+makeSlider("FOV size", FOV_MIN, FOV_MAX, "fov", " px")
+makeSlider("Lock strength", 1, 100, "strength", "%")
+makeToggle("Show FOV circle", "showCircle")
+makeToggle("Wall check", "wallCheck")
+makeToggle("Team check", "teamCheck")
+
+-- ====================================================================
+-- ====== MENU OPEN/CLOSE (frees the mouse while it's open) ===========
+-- ====================================================================
+local menuOpen = false
+local saved = nil
+
+local function setMenu(open)
+	if open == menuOpen then return end
+	menuOpen = open
+	menu.Visible = open
+
+	if open then
+		saved = {
+			cameraMode = player.CameraMode,
+			behavior = UserInputService.MouseBehavior,
+			icon = UserInputService.MouseIconEnabled,
+		}
+		-- a first-person camera script would keep re-locking the mouse, so pause it while the menu is open
+		local ps = player:FindFirstChild("PlayerScripts")
+		local fp = ps and ps:FindFirstChild("FirstPersonCamera")
+		if fp and fp:IsA("LocalScript") and not fp.Disabled then
+			saved.fp = fp
+			fp.Disabled = true
+		end
+		pcall(function() RunService:UnbindFromRenderStep("AimLockMouse") end)
+		RunService:BindToRenderStep("AimLockMouse", Enum.RenderPriority.Camera.Value + 10, function()
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			UserInputService.MouseIconEnabled = true
+		end)
+		pop(menu, 0.85)
+		renderAll()
+	else
+		pcall(function() RunService:UnbindFromRenderStep("AimLockMouse") end)
+		if saved then
+			if saved.fp then saved.fp.Disabled = false end
+			player.CameraMode = saved.cameraMode
+			UserInputService.MouseBehavior = saved.behavior
+			UserInputService.MouseIconEnabled = saved.icon
+			saved = nil
+		end
+	end
+end
+
+-- ====================================================================
+-- ====== TARGETING ===================================================
+-- ====================================================================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- returns the part to aim at and how far (pixels) it is from the crosshair, or nil if it can't be targeted
+local function evaluate(plr, cam)
+	if plr == player then return nil end
+	local char = plr.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return nil end
+	if settings.teamCheck and plr.Team ~= nil and plr.Team == player.Team then return nil end
+
+	local part = char:FindFirstChild(TARGET_PART) or char:FindFirstChild("HumanoidRootPart")
+	if not part then return nil end
+
+	local v, onScreen = cam:WorldToViewportPoint(part.Position)
+	if not onScreen then return nil end
+	local d = (Vector2.new(v.X, v.Y) - cam.ViewportSize / 2).Magnitude
+
+	if settings.wallCheck then
+		rayParams.FilterDescendantsInstances = { player.Character }
+		local origin = cam.CFrame.Position
+		local res = workspace:Raycast(origin, part.Position - origin, rayParams)
+		if res and not res.Instance:IsDescendantOf(char) then return nil end
+	end
+	return part, d
+end
+
+local locked = nil -- the player we're currently locked onto
+
+RunService:BindToRenderStep("AimLock", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	local cam = workspace.CurrentCamera
+	local holding = UserInputService:IsMouseButtonPressed(LOCK_BUTTON)
+
+	if not settings.enabled or menuOpen or not holding or not cam then
+		locked = nil
+		circleStroke.Color = WHITE
+		return
+	end
+
+	local part = nil
+	if locked then -- stay on the same target while you hold the button, as long as you can still see them
+		part = evaluate(locked, cam)
+		if not part then locked = nil end
+	end
+	if not locked then -- otherwise pick whoever is closest to the crosshair inside the circle
+		local bestD = settings.fov
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local p, d = evaluate(plr, cam)
+			if p and d <= bestD then
+				bestD = d
+				locked, part = plr, p
+			end
+		end
+	end
+
+	circleStroke.Color = locked and GOLD or WHITE
+	if part then
+		local goal = CFrame.lookAt(cam.CFrame.Position, part.Position)
+		local speed = 2 + settings.strength * 0.3 -- strength 100 = near instant
+		cam.CFrame = cam.CFrame:Lerp(goal, 1 - math.exp(-speed * dt))
+	end
+end)
+
+-- ====================================================================
+-- ====== INPUT =======================================================
+-- ====================================================================
+UserInputService.InputBegan:Connect(function(input)
+	if UserInputService:GetFocusedTextBox() then return end
+	if input.KeyCode == TOGGLE_KEY then
+		settings.enabled = not settings.enabled
+		updateStatus()
+		updateCircle()
+		renderAll()
+		pop(status, 0.8)
+	elseif input.KeyCode == MENU_KEY then
+		setMenu(not menuOpen)
+	end
+end)
+
+player.CharacterRemoving:Connect(function()
+	locked = nil
+end)
+
+updateStatus()
+updateCircle()
