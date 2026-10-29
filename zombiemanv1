@@ -124,6 +124,18 @@ status.TextXAlignment = Enum.TextXAlignment.Left
 status.Parent = gui
 styleText(status, 15, SILVER)
 
+-- small menu hint, bottom left (sits just above the status text)
+local menuChip = Instance.new("TextLabel")
+menuChip.Name = "MenuChip"
+menuChip.AnchorPoint = Vector2.new(0, 1)
+menuChip.Position = UDim2.new(0, 20, 1, -88)
+menuChip.Size = UDim2.fromOffset(240, 20)
+menuChip.BackgroundTransparency = 1
+menuChip.TextXAlignment = Enum.TextXAlignment.Left
+menuChip.Text = "[" .. MENU_KEY.Name .. "] Settings Menu"
+menuChip.Parent = gui
+styleText(menuChip, 15, SILVER)
+
 -- FOV circle (centered on the crosshair)
 local circle = Instance.new("Frame")
 circle.Name = "FovCircle"
