@@ -1,0 +1,1608 @@
+-- CandyFarm (LocalScript in StarterPlayer > StarterPlayerScripts)
+-- Halloween auto farm with a dark red themed UI.
+--   [N]  pause / resume everything
+--   [M]  open the menu (toggles + stats + live log)
+--
+-- Features (each has its own toggle):
+--   Auto Candy         -> teleports to every "Candy" in Workspace.HalloweenCandy (Tools / Models / Parts / Configurations)
+--   Auto Trick or Treat-> holds E on every "DoorTreeTemplate" in Workspace.HalloweenDoorTrees (5s gap between trees)
+--   Auto Pinata        -> sticks to "Penyta" things in Workspace.Live and attacks until they break
+--   Auto Zombie        -> same thing for "Halloween Zombie" in Workspace.Live
+-- Priority: Candy > Pinata/Zombie > Trick or Treat.
+-- Teleports / actions WAIT while you are ragdolled and continue once you've gotten up.
+--
+-- FIX: collectCandy() was never defined (caused "attempt to call a nil value" in step()). Added below.
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local T0 = os.clock()
+
+-- ====================================================================
+-- ====== CONFIG ======================================================
+-- ====================================================================
+local C = {
+	TOGGLE_KEY = Enum.KeyCode.N,
+	MENU_KEY = Enum.KeyCode.M,
+
+	-- folders / names
+	CANDY_FOLDER = "HalloweenCandy",
+	CANDY_NAME = "Candy",
+	TREE_FOLDER = "HalloweenDoorTrees",
+	TREE_NAME = "DoorTreeTemplate",
+	LIVE_FOLDER = "Live",
+	PINATA_MATCH = { "penyta", "pinata", "penyata" },
+	ZOMBIE_MATCH = { "halloween zombie" },
+
+	RAGDOLL_FLAGS = { "Ragdolled", "Ragdoll", "IsRagdolled", "Stunned", "IsStunned", "Knocked", "KnockedDown" },
+	RAGDOLL_TIMEOUT = math.huge, -- wait as long as it takes to get up (never gives up)
+	RAGDOLL_SETTLE = 0.3,        -- must be continuously free this long before acting
+
+	-- candy
+	CANDY_Y_OFFSET = 0,
+	CANDY_CONFIRM = 0.25,
+	CANDY_MAX_ATTEMPTS = 4,
+	CANDY_WAIT = 0.1,
+	CANDY_INTERRUPTS_HOLD = true,
+	CANDY_INTERRUPTS_ANIM = true,
+	-- attribute names checked first when a candy has no parts (Configuration objects)
+	CANDY_POS_ATTRS = { "Rest", "Position", "Pos", "Location", "Target" }, -- "Rest" = where the candy lands (From = launch point, ignored)
+	CANDY_IGNORE_ATTRS = { From = true, Origin = true, SpawnPosition = true, StartPosition = true },
+
+	-- trick or treat
+	TREE_DIST = 3,
+	TREE_HOLD_EXTRA = 0.25,
+	TREE_ANIM_TIME = 7.5,
+	TREE_GAP = 5,               -- extra seconds to wait between finishing one tree and starting the next
+	TREE_COOLDOWN = 45,
+	TREE_FAIL_COOLDOWN = 10,
+	TREE_RETRIES = 3,
+
+	-- combat
+	STICK_DISTANCE = 7,    -- how far (studs) you stand from the pinata / zombie. Raise it if it still flings, lower it if hits don't land
+	STICK_TOLERANCE = 1.5, -- you only get moved if you drift more than this far from STICK_DISTANCE
+	ATTACK_INTERVAL = 0.1,
+	USE_COMBOS = true,
+	COMBO_EVERY = 4,
+	COMBO_KEYS = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four },
+	FIGHT_TIMEOUT = 60,
+	POST_BREAK_BLACKLIST = 15,
+	POP_DETECT_RADIUS = 70,
+	FIGHT_LOG_INTERVAL = 2,
+
+	CUSTOM_M1 = nil,
+	CUSTOM_COMBO = nil,
+
+	STATUS_LOG_INTERVAL = 10,
+}
+
+-- ====================================================================
+-- ====== STATE =======================================================
+-- ====================================================================
+local settings = {
+	master = true,
+	candy = false,
+	tree = false,
+	pinata = false,
+	zombie = false,
+	verbose = false,
+}
+local stats = { candy = 0, trees = 0, pinatas = 0, zombies = 0 }
+
+-- ====================================================================
+-- ====== STYLE (dark red) ============================================
+-- ====================================================================
+local FONT = Enum.Font.FredokaOne
+local WHITE = Color3.new(1, 1, 1)
+local EDGE = Color3.fromRGB(6, 1, 3)
+local SILVER = Color3.fromRGB(200, 170, 176)
+local RED = Color3.fromRGB(215, 30, 50)
+local RED_BRIGHT = Color3.fromRGB(245, 85, 100)
+local RED_DARK = Color3.fromRGB(105, 8, 20)
+local BG_TOP = Color3.fromRGB(34, 5, 10)
+local BG_BOTTOM = Color3.fromRGB(10, 2, 4)
+local ROW_OFF = Color3.fromRGB(30, 9, 14)
+local ROW_ON = Color3.fromRGB(135, 16, 32)
+local SW_OFF = Color3.fromRGB(14, 4, 7)
+local SW_ON = Color3.fromRGB(235, 55, 70)
+
+local LEVEL_COLORS = {
+	INFO = Color3.fromRGB(225, 205, 208),
+	OK = Color3.fromRGB(130, 255, 170),
+	WARN = Color3.fromRGB(255, 205, 90),
+	ERR = Color3.fromRGB(255, 90, 90),
+	DBG = Color3.fromRGB(140, 115, 120),
+}
+
+local POP = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local FAST = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- ====================================================================
+-- ====== LOGGING =====================================================
+-- ====================================================================
+local history = {}
+local uiAdd = nil
+
+local function log(level, ...)
+	if level == "DBG" and not settings.verbose then return end
+	local parts = table.pack(...)
+	for i = 1, parts.n do parts[i] = tostring(parts[i]) end
+	local msg = table.concat(parts, " ")
+	local line = string.format("[CandyFarm][%7.2f][%s] %s", os.clock() - T0, level, msg)
+	if level == "WARN" or level == "ERR" then warn(line) else print(line) end
+	local entry = { t = os.clock() - T0, level = level, msg = msg }
+	table.insert(history, entry)
+	if #history > 200 then table.remove(history, 1) end
+	if uiAdd then uiAdd(entry) end
+end
+
+-- ====================================================================
+-- ====== HELPERS =====================================================
+-- ====================================================================
+local env = getfenv()
+local ext_mouse1click = env.mouse1click
+local ext_firetouch = env.firetouchinterest
+local ext_fireprompt = env.fireproximityprompt
+local ext_fireclick = env.fireclickdetector
+
+local function getChar()
+	local c = player.Character
+	if not c then return nil end
+	local h = c:FindFirstChildOfClass("Humanoid")
+	local r = c:FindFirstChild("HumanoidRootPart")
+	if h and r then return c, h, r end
+	return nil
+end
+
+local function vecFromValue(v)
+	if typeof(v) == "Vector3" then return v end
+	if typeof(v) == "CFrame" then return v.Position end
+	return nil
+end
+
+-- works for Parts, Models, Tools (uses Handle), Configurations (position stored in attributes / values)
+local function getPos(inst)
+	if inst:IsA("BasePart") then return inst.Position end
+	if inst:IsA("Tool") then
+		local h = inst:FindFirstChild("Handle")
+		if h and h:IsA("BasePart") then return h.Position end
+	end
+	if inst:IsA("Model") then
+		local ok, cf = pcall(inst.GetPivot, inst)
+		if ok and cf then return cf.Position end
+	end
+	local p = inst:FindFirstChildWhichIsA("BasePart", true)
+	if p then return p.Position end
+
+	-- attributes: well-known names first, then any Vector3 / CFrame attribute
+	for _, n in ipairs(C.CANDY_POS_ATTRS) do
+		local v = vecFromValue(inst:GetAttribute(n))
+		if v then return v end
+	end
+	for _, v in pairs(inst:GetAttributes()) do
+		local vec = vecFromValue(v)
+		if vec then return vec end
+	end
+
+	for _, ch in ipairs(inst:GetChildren()) do
+		if ch:IsA("Vector3Value") then return ch.Value end
+		if ch:IsA("CFrameValue") then return ch.Value.Position end
+	end
+	return nil
+end
+
+local function nameMatches(name, list)
+	local l = string.lower(name)
+	for _, p in ipairs(list) do
+		if string.find(l, p, 1, true) then return true end
+	end
+	return false
+end
+
+local function active(feature)
+	return settings.master and settings[feature]
+end
+
+-- ====================================================================
+-- ====== RAGDOLL CHECK ===============================================
+-- ====================================================================
+local BAD_STATES = {
+	[Enum.HumanoidStateType.Ragdoll] = true,
+	[Enum.HumanoidStateType.FallingDown] = true,
+	[Enum.HumanoidStateType.GettingUp] = true,
+	[Enum.HumanoidStateType.Physics] = true,
+	[Enum.HumanoidStateType.PlatformStanding] = true,
+	[Enum.HumanoidStateType.Dead] = true,
+}
+
+local function ragdollReason(c, h)
+	if h.Health <= 0 then return "dead" end
+	local st = h:GetState()
+	if BAD_STATES[st] then return "state " .. st.Name end
+	if h.PlatformStand then return "PlatformStand" end
+	for _, n in ipairs(C.RAGDOLL_FLAGS) do
+		if c:GetAttribute(n) == true or h:GetAttribute(n) == true or player:GetAttribute(n) == true then
+			return "attribute " .. n
+		end
+		local v = c:FindFirstChild(n)
+		if v and v:IsA("BoolValue") and v.Value then return "BoolValue " .. n end
+	end
+	return nil
+end
+
+-- Waits until the character is free (not ragdolled / dead) for RAGDOLL_SETTLE seconds in a row.
+-- Returns false only if the farm is paused, the given feature is switched off, or the timeout is hit.
+local function waitReady(timeout, feature)
+	local t0 = os.clock()
+	local announced = false
+	local freeSince = nil
+	while true do
+		if not settings.master then return false end
+		if feature and not settings[feature] then return false end
+
+		local c, h = getChar()
+		local why = "no character"
+		if c then why = ragdollReason(c, h) end
+
+		if why then
+			freeSince = nil
+			if not announced then
+				log("INFO", "Waiting, can't act:", why)
+				announced = true
+			end
+		else
+			freeSince = freeSince or os.clock()
+			if os.clock() - freeSince >= C.RAGDOLL_SETTLE then
+				if announced then log("INFO", string.format("Free again after %.2fs", os.clock() - t0)) end
+				return true
+			end
+		end
+
+		if os.clock() - t0 >= timeout then
+			log("WARN", string.format("waitReady timed out after %.1fs", timeout))
+			return false
+		end
+		task.wait()
+	end
+end
+
+local function teleportTo(cf, feature)
+	if not waitReady(C.RAGDOLL_TIMEOUT, feature) then
+		log("DBG", "Teleport skipped (paused / feature off)")
+		return false
+	end
+	local c, _, r = getChar()
+	if not c then return false end
+	c:PivotTo(cf)
+	r.AssemblyLinearVelocity = Vector3.zero
+	r.AssemblyAngularVelocity = Vector3.zero
+	return true
+end
+
+-- ====================================================================
+-- ====== INPUT (attacks) =============================================
+-- ====================================================================
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local deadMethods = {}
+local lastClickMethod, lastKeyMethod = nil, nil
+local warnedNoAttack = false
+
+local clickMethods = {
+	{ name = "custom", fn = function()
+		if not C.CUSTOM_M1 then return false end
+		C.CUSTOM_M1()
+		return true
+	end },
+	{ name = "VirtualInputManager", fn = function()
+		if not VIM then return false end
+		local cam = Workspace.CurrentCamera
+		local x, y = cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2
+		VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+		VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+		return true
+	end },
+	{ name = "Tool:Activate", fn = function()
+		local c = player.Character
+		local tool = c and c:FindFirstChildOfClass("Tool")
+		if not tool then return false end
+		tool:Activate()
+		return true
+	end },
+	{ name = "mouse1click", fn = function()
+		if not ext_mouse1click then return false end
+		ext_mouse1click()
+		return true
+	end },
+}
+
+local function doClick()
+	for _, m in ipairs(clickMethods) do
+		if not deadMethods[m.name] then
+			local ok, res = pcall(m.fn)
+			if ok and res then
+				if lastClickMethod ~= m.name then
+					log("INFO", "M1 attack method in use:", m.name)
+					lastClickMethod = m.name
+				end
+				return true
+			elseif not ok then
+				deadMethods[m.name] = true
+				log("WARN", "M1 method failed and was disabled:", m.name, "-", res)
+			end
+		end
+	end
+	if not warnedNoAttack then
+		warnedNoAttack = true
+		log("ERR", "No M1 method works! Set C.CUSTOM_M1 at the top of the script to your game's attack.")
+	end
+	return false
+end
+
+local function pressCombo(key)
+	if C.CUSTOM_COMBO and not deadMethods.customKey then
+		local ok, err = pcall(C.CUSTOM_COMBO, key)
+		if ok then
+			if lastKeyMethod ~= "custom" then log("INFO", "Combo method in use: custom"); lastKeyMethod = "custom" end
+			return true
+		end
+		deadMethods.customKey = true
+		log("WARN", "CUSTOM_COMBO failed and was disabled:", err)
+	end
+	if VIM and not deadMethods.vimKey then
+		local ok, err = pcall(function()
+			VIM:SendKeyEvent(true, key, false, game)
+			task.delay(0.03, function() pcall(function() VIM:SendKeyEvent(false, key, false, game) end) end)
+		end)
+		if ok then
+			if lastKeyMethod ~= "VirtualInputManager" then
+				log("INFO", "Combo method in use: VirtualInputManager")
+				lastKeyMethod = "VirtualInputManager"
+			end
+			return true
+		end
+		deadMethods.vimKey = true
+		log("WARN", "VirtualInputManager key press failed and was disabled:", err)
+	end
+	return false
+end
+
+local lastAttack, comboCounter, comboIdx = 0, 0, 1
+local function attack()
+	local now = os.clock()
+	if now - lastAttack < C.ATTACK_INTERVAL then return end
+	lastAttack = now
+	comboCounter += 1
+	if C.USE_COMBOS and comboCounter % C.COMBO_EVERY == 0 then
+		local key = C.COMBO_KEYS[comboIdx]
+		comboIdx = comboIdx % #C.COMBO_KEYS + 1
+		log("DBG", "combo key", key.Name)
+		if pressCombo(key) then return end
+	end
+	doClick()
+end
+
+-- ====================================================================
+-- ====== CANDY =======================================================
+-- ====================================================================
+local candyAttempts = setmetatable({}, { __mode = "k" })
+local currentFight = nil
+local dumpedCandy = false
+
+-- still sitting in the candy folder? (a picked up Tool moves to your Backpack, so Parent isn't nil)
+local function candyStillThere(candy)
+	local p = candy.Parent
+	return p ~= nil and p.Name == C.CANDY_FOLDER
+end
+
+-- one-time debug dump so you can see exactly what a "Candy" is
+local function dumpCandy(candy)
+	if dumpedCandy then return end
+	dumpedCandy = true
+	log("INFO", "Candy object info:", candy.ClassName, "|", candy:GetFullName())
+	local kids = {}
+	for i, ch in ipairs(candy:GetChildren()) do
+		if i > 10 then table.insert(kids, "...") break end
+		table.insert(kids, ch.Name .. "(" .. ch.ClassName .. ")")
+	end
+	log("INFO", "Candy children:", #kids > 0 and table.concat(kids, ", ") or "none")
+	for k, v in pairs(candy:GetAttributes()) do
+		log("INFO", "Candy attribute:", k, "=", tostring(v), "(" .. typeof(v) .. ")")
+	end
+end
+
+local warnedNoPos = setmetatable({}, { __mode = "k" })
+
+-- one saved position per Candy object (remembers the last good one)
+local candyPosCache = setmetatable({}, { __mode = "k" })
+local candyPosSource = setmetatable({}, { __mode = "k" })
+
+local function resolvePos(inst, depth)
+	depth = depth or 0
+	if depth > 4 or not inst then return nil end
+
+	-- 1. real parts
+	if inst:IsA("BasePart") then return inst.Position, "BasePart" end
+	if inst:IsA("Tool") then
+		local h = inst:FindFirstChild("Handle")
+		if h and h:IsA("BasePart") then return h.Position, "Tool.Handle" end
+	end
+	if inst:IsA("Model") then
+		local ok, cf = pcall(inst.GetPivot, inst)
+		if ok and cf then return cf.Position, "Model pivot" end
+	end
+	local part = inst:FindFirstChildWhichIsA("BasePart", true)
+	if part then return part.Position, "child part " .. part.Name end
+
+	-- 2. Vector3 / CFrame attributes
+	for _, n in ipairs(C.CANDY_POS_ATTRS) do
+		local v = vecFromValue(inst:GetAttribute(n))
+		if v then return v, "attribute " .. n end
+	end
+	for k, v in pairs(inst:GetAttributes()) do
+		if not C.CANDY_IGNORE_ATTRS[k] then
+			local vec = vecFromValue(v)
+			if vec then return vec, "attribute " .. k end
+		end
+	end
+
+	-- 3. separate X / Y / Z number attributes
+	local ax, ay, az = inst:GetAttribute("X"), inst:GetAttribute("Y"), inst:GetAttribute("Z")
+	if type(ax) == "number" and type(ay) == "number" and type(az) == "number" then
+		return Vector3.new(ax, ay, az), "attributes X/Y/Z"
+	end
+
+	-- 4. value objects inside it
+	local nx, ny, nz
+	for _, ch in ipairs(inst:GetChildren()) do
+		if ch:IsA("Vector3Value") then return ch.Value, "Vector3Value " .. ch.Name end
+		if ch:IsA("CFrameValue") then return ch.Value.Position, "CFrameValue " .. ch.Name end
+		if ch:IsA("ObjectValue") and ch.Value then
+			local p, src = resolvePos(ch.Value, depth + 1)
+			if p then return p, "ObjectValue " .. ch.Name .. " -> " .. src end
+		end
+		if ch:IsA("NumberValue") or ch:IsA("IntValue") then
+			local n = string.upper(ch.Name)
+			if n == "X" then nx = ch.Value elseif n == "Y" then ny = ch.Value elseif n == "Z" then nz = ch.Value end
+		end
+	end
+	if nx and ny and nz then return Vector3.new(nx, ny, nz), "NumberValues X/Y/Z" end
+
+	return nil
+end
+
+local function candyPoint(candy)
+	local p, src = resolvePos(candy)
+	if p then
+		candyPosCache[candy] = p
+		candyPosSource[candy] = src
+		return p
+	end
+	return candyPosCache[candy] -- fall back to the last known good spot
+end
+
+local function findCandy()
+	local f = Workspace:FindFirstChild(C.CANDY_FOLDER)
+	if not f then return nil end
+	local _, _, r = getChar()
+	if not r then return nil end
+	local best, bestD = nil, math.huge
+	for _, ch in ipairs(f:GetChildren()) do
+		if ch.Name == C.CANDY_NAME and (candyAttempts[ch] or 0) < C.CANDY_MAX_ATTEMPTS then
+			local p = candyPoint(ch)
+			if p then
+				local d = (p - r.Position).Magnitude
+				if d < bestD then best, bestD = ch, d end
+			elseif not warnedNoPos[ch] then
+				warnedNoPos[ch] = true
+				log("WARN", "A candy has no readable position:", ch.ClassName, ch:GetFullName())
+				dumpCandy(ch)
+			end
+		end
+	end
+	return best
+end
+
+-- the part you'd actually touch to pick the candy up (for firetouchinterest, if your executor has it)
+local function candyTouchPart(candy)
+	if candy:IsA("BasePart") then return candy end
+	if candy:IsA("Tool") then
+		local h = candy:FindFirstChild("Handle")
+		if h and h:IsA("BasePart") then return h end
+	end
+	return candy:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- teleports onto one candy and checks whether it got picked up
+local function collectCandy(candy)
+	if not candy or not candy.Parent then return end
+
+	candyAttempts[candy] = (candyAttempts[candy] or 0) + 1
+	local attempt = candyAttempts[candy]
+
+	local p = candyPoint(candy)
+	if not p then
+		candyAttempts[candy] = C.CANDY_MAX_ATTEMPTS
+		log("WARN", "Candy has no position, skipping:", candy:GetFullName())
+		return
+	end
+
+	-- timing attributes (server time): don't chase expired candy, wait for it to land first
+	local born, fly, expire = candy:GetAttribute("Born"), candy:GetAttribute("Fly"), candy:GetAttribute("Expire")
+	local now = Workspace:GetServerTimeNow()
+	if type(expire) == "number" and now >= expire - 0.3 then
+		candyAttempts[candy] = C.CANDY_MAX_ATTEMPTS
+		log("DBG", "Candy about to expire, skipping")
+		return
+	end
+	if type(born) == "number" and type(fly) == "number" then
+		local landAt = born + fly
+		while Workspace:GetServerTimeNow() < landAt do
+			task.wait()
+			if not active("candy") or not candy.Parent then return end
+		end
+	end
+
+	log("DBG", string.format("Candy attempt %d/%d at %s via %s", attempt, C.CANDY_MAX_ATTEMPTS,
+		tostring(p), candyPosSource[candy] or "cache"))
+
+	local target = CFrame.new(p + Vector3.new(0, C.CANDY_Y_OFFSET, 0))
+	if not teleportTo(target, "candy") then
+		-- paused / toggled off: don't burn an attempt
+		candyAttempts[candy] = math.max(0, attempt - 1)
+		return
+	end
+
+	-- optional extra: fake a touch if the executor supports it
+	if ext_firetouch then
+		local _, _, r = getChar()
+		local part = candyTouchPart(candy)
+		if r and part then
+			pcall(ext_firetouch, r, part, 0)
+			pcall(ext_firetouch, r, part, 1)
+		end
+	end
+
+	local t0 = os.clock()
+	while os.clock() - t0 < C.CANDY_CONFIRM do
+		task.wait()
+		if not active("candy") then return end
+		if not candyStillThere(candy) then break end
+	end
+
+	if not candyStillThere(candy) then
+		stats.candy += 1
+		candyAttempts[candy] = nil
+		log("OK", "Candy collected (total " .. stats.candy .. ")")
+	else
+		log("DBG", "Candy still there after attempt " .. attempt)
+	end
+end
+
+-- logs every candy and where its position came from
+local function scanCandy()
+	local f = Workspace:FindFirstChild(C.CANDY_FOLDER)
+	if not f then return end
+	local ok, bad = 0, 0
+	for _, ch in ipairs(f:GetChildren()) do
+		if ch.Name == C.CANDY_NAME then
+			local p = candyPoint(ch)
+			if p then
+				ok += 1
+				log("DBG", ch.ClassName, "->", tostring(p), "via", candyPosSource[ch] or "cache")
+			else
+				bad += 1
+				log("WARN", "No position for", ch.ClassName, ch:GetFullName())
+			end
+		end
+	end
+	log("INFO", "Candy scan:", ok, "have a position,", bad, "don't")
+end
+
+local function hookCandyFolder(folder)
+	log("OK", "Hooked candy folder '" .. folder.Name .. "' (" .. #folder:GetChildren() .. " children right now)")
+	folder.ChildAdded:Connect(function(ch)
+		log("INFO", "Candy spawned:", ch.Name, ch.ClassName)
+		task.defer(function()
+			local fight = currentFight
+			if fight and fight.kind == "pinata" then
+				local p = candyPoint(ch)
+				if p and (p - fight.pos).Magnitude <= C.POP_DETECT_RADIUS then
+					fight.popped = true
+					log("INFO", "Pinata pop detected via candy spawn near target")
+				end
+			end
+		end)
+	end)
+	folder.ChildRemoved:Connect(function(ch)
+		log("DBG", "Candy removed:", ch.Name)
+	end)
+end
+
+-- ====================================================================
+-- ====== PINATA / ZOMBIE FIGHTING ====================================
+-- ====================================================================
+local blacklist = setmetatable({}, { __mode = "k" })
+
+local function findTarget()
+	local live = Workspace:FindFirstChild(C.LIVE_FOLDER)
+	if not live then return nil end
+	local _, _, r = getChar()
+	if not r then return nil end
+	local best, bestKind, bestD = nil, nil, math.huge
+	for _, m in ipairs(live:GetChildren()) do
+		if (blacklist[m] or 0) < os.clock() then
+			local kind = nil
+			if settings.pinata and nameMatches(m.Name, C.PINATA_MATCH) then
+				kind = "pinata"
+			elseif settings.zombie and nameMatches(m.Name, C.ZOMBIE_MATCH) then
+				kind = "zombie"
+			end
+			if kind then
+				local hum = m:FindFirstChildOfClass("Humanoid")
+				if not hum or hum.Health > 0 then
+					local p = getPos(m)
+					if p then
+						local d = (p - r.Position).Magnitude
+						if d < bestD then best, bestKind, bestD = m, kind, d end
+					end
+				end
+			end
+		end
+	end
+	return best, bestKind
+end
+
+-- keeps you at STICK_DISTANCE from the target (on whatever side you're already on) and facing it.
+-- Only moves you when you drift out of range, so you never get shoved into it / fling it.
+local function stickTo(p)
+	local c, _, r = getChar()
+	if not c then return end
+
+	local mine = r.Position
+	local flat = Vector3.new(mine.X - p.X, 0, mine.Z - p.Z)
+	local dist = flat.Magnitude
+	local dir = dist > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+
+	local inRange = math.abs(dist - C.STICK_DISTANCE) <= C.STICK_TOLERANCE and math.abs(mine.Y - p.Y) <= 4
+	local pos = mine
+	if not inRange then
+		pos = Vector3.new(p.X, p.Y, p.Z) + dir * C.STICK_DISTANCE
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+	end
+	c:PivotTo(CFrame.lookAt(pos, Vector3.new(p.X, pos.Y, p.Z)))
+end
+
+local function fightTarget(t, kind)
+	local label = kind .. " '" .. t.Name .. "'"
+	log("INFO", "FIGHT start:", label)
+	local fight = { kind = kind, pos = getPos(t) or Vector3.zero, popped = false }
+	currentFight = fight
+	local startT, lastLog = os.clock(), 0
+	local hum = t:FindFirstChildOfClass("Humanoid")
+	local broke, reason = false, "?"
+
+	while true do
+		task.wait()
+		if not active(kind) then reason = "toggled off / paused" break end
+		if not t.Parent then broke, reason = true, "removed from Live" break end
+		if hum and hum.Health <= 0 then broke, reason = true, "health reached 0" break end
+		if kind == "pinata" and fight.popped then broke, reason = true, "candy spawned nearby" break end
+		if os.clock() - startT > C.FIGHT_TIMEOUT then
+			reason = "timeout"
+			blacklist[t] = os.clock() + 30
+			log("WARN", "FIGHT timeout on", label, "- blacklisting for 30s")
+			break
+		end
+
+		local c, h = getChar()
+		if not c or h.Health <= 0 then reason = "you died" break end
+
+		if ragdollReason(c, h) then
+			-- wait until you're up again; only gives up if toggled off / paused
+			if not waitReady(C.RAGDOLL_TIMEOUT, kind) then reason = "toggled off / paused" break end
+		else
+			local p = getPos(t)
+			if p then
+				fight.pos = p
+				stickTo(p)
+			end
+			attack()
+			if os.clock() - lastLog >= C.FIGHT_LOG_INTERVAL then
+				lastLog = os.clock()
+				log("DBG", string.format("fighting %s (%.1fs) hp=%s", label, os.clock() - startT,
+					hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "n/a"))
+			end
+		end
+	end
+	currentFight = nil
+
+	if t.Parent then blacklist[t] = os.clock() + C.POST_BREAK_BLACKLIST end
+	log("INFO", string.format("FIGHT end: %s - %s (%.1fs)", label, reason, os.clock() - startT))
+
+	if broke then
+		if kind == "pinata" then stats.pinatas += 1 else stats.zombies += 1 end
+		log("OK", label .. " broke! Waiting for candy to spawn...")
+		local t0 = os.clock()
+		while os.clock() - t0 < C.CANDY_WAIT and not findCandy() do task.wait() end
+		if findCandy() then
+			log("INFO", string.format("Candy appeared %.2fs after break", os.clock() - t0))
+		else
+			log("WARN", "No candy appeared within " .. C.CANDY_WAIT .. "s after break")
+		end
+	end
+end
+
+-- ====================================================================
+-- ====== TRICK OR TREAT ==============================================
+-- ====================================================================
+local treeCooldown = setmetatable({}, { __mode = "k" })
+local lastTreeEnd = 0 -- when the last tree finished (used for the gap between trees)
+
+local function nextTree()
+	local f = Workspace:FindFirstChild(C.TREE_FOLDER)
+	if not f then return nil end
+	local _, _, r = getChar()
+	if not r then return nil end
+	local best, bestPrompt, bestD = nil, nil, math.huge
+	for _, t in ipairs(f:GetChildren()) do
+		if t.Name == C.TREE_NAME and (treeCooldown[t] or 0) < os.clock() then
+			local prompt = t:FindFirstChildWhichIsA("ProximityPrompt", true)
+			if prompt and prompt.Enabled then
+				local p = getPos(t)
+				if p then
+					local d = (p - r.Position).Magnitude
+					if d < bestD then best, bestPrompt, bestD = t, prompt, d end
+				end
+			end
+		end
+	end
+	return best, bestPrompt
+end
+
+local function promptPos(prompt, tree)
+	local par = prompt.Parent
+	if par and par:IsA("BasePart") then return par.Position end
+	if par and par:IsA("Attachment") then return par.WorldPosition end
+	return getPos(tree)
+end
+
+local function sleepChecked(seconds, feature, candyInterrupts)
+	local t0 = os.clock()
+	while os.clock() - t0 < seconds do
+		task.wait()
+		if not active(feature) then return "disabled" end
+		if candyInterrupts and settings.candy and findCandy() then return "candy" end
+	end
+	return nil
+end
+
+local function doTree(tree, prompt)
+	log("INFO", "TRICK OR TREAT start:", tree:GetFullName(), "hold =", prompt.HoldDuration)
+	pcall(function() prompt.RequiresLineOfSight = false end)
+
+	local pos = promptPos(prompt, tree)
+	if not pos then log("WARN", "Tree has no position, skipping") treeCooldown[tree] = os.clock() + 10 return end
+	local standPos = pos + Vector3.new(0, 0, C.TREE_DIST)
+	local standCF = CFrame.lookAt(standPos, Vector3.new(pos.X, standPos.Y, pos.Z))
+
+	local triggered = false
+	local conn = prompt.Triggered:Connect(function(who)
+		if who == player then triggered = true end
+	end)
+
+	local success = false
+	local attempt = 0
+	while attempt < C.TREE_RETRIES do
+		attempt += 1
+		if not active("tree") then break end
+		log("DBG", "Tree attempt", attempt)
+		if not teleportTo(standCF, "tree") then
+			task.wait(0.25)
+			continue
+		end
+		task.wait(0.1)
+
+		pcall(prompt.InputHoldBegin, prompt)
+		local t0 = os.clock()
+		local need = prompt.HoldDuration + C.TREE_HOLD_EXTRA
+		local interrupted = nil
+		while os.clock() - t0 < need and not triggered do
+			task.wait()
+			if not active("tree") then interrupted = "disabled" break end
+			if not prompt.Enabled then interrupted = "prompt disabled" break end
+			if C.CANDY_INTERRUPTS_HOLD and settings.candy and findCandy() then interrupted = "candy" break end
+			local c, h, r = getChar()
+			if not c then interrupted = "no character" break end
+			if ragdollReason(c, h) then interrupted = "ragdoll" break end
+			if (r.Position - standPos).Magnitude > 5 then
+				c:PivotTo(standCF)
+				r.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+		pcall(prompt.InputHoldEnd, prompt)
+
+		if triggered then
+			success = true
+			log("INFO", string.format("Prompt triggered after %.2fs", os.clock() - t0))
+			break
+		elseif interrupted == nil then
+			success = true
+			log("WARN", "Held full time but Triggered never fired - assuming it worked")
+			break
+		elseif interrupted == "candy" then
+			log("INFO", "Hold interrupted by candy spawn - collecting first, tree stays available")
+			conn:Disconnect()
+			return
+		elseif interrupted == "disabled" then
+			break
+		elseif interrupted == "ragdoll" then
+			-- ragdolls don't use up a retry: wait until you're up, then try again
+			log("INFO", "Ragdolled during hold - waiting, then retrying")
+			attempt -= 1
+			waitReady(C.RAGDOLL_TIMEOUT, "tree")
+		else
+			log("WARN", "Hold interrupted:", interrupted, "(attempt " .. attempt .. ")")
+			task.wait(0.2)
+		end
+	end
+	conn:Disconnect()
+
+	if success then
+		stats.trees += 1
+		treeCooldown[tree] = os.clock() + C.TREE_COOLDOWN
+		log("OK", "Trick or treat done (total " .. stats.trees .. "), waiting " .. C.TREE_ANIM_TIME .. "s for animation")
+		local why = sleepChecked(C.TREE_ANIM_TIME, "tree", C.CANDY_INTERRUPTS_ANIM)
+		if why then log("INFO", "Animation wait cut short:", why) end
+		lastTreeEnd = os.clock()
+		log("INFO", "Next tree allowed in " .. C.TREE_GAP .. "s")
+	elseif active("tree") then
+		treeCooldown[tree] = os.clock() + C.TREE_FAIL_COOLDOWN
+		lastTreeEnd = os.clock()
+		log("WARN", "Trick or treat failed on this tree, retrying in " .. C.TREE_FAIL_COOLDOWN .. "s")
+	end
+end
+
+-- ====================================================================
+-- ====== MAIN LOOP ===================================================
+-- ====================================================================
+local lastIdleLog = 0
+
+local function step()
+	local c, h = getChar()
+	if not c or h.Health <= 0 then return false end
+
+	if settings.candy then
+		local candy = findCandy()
+		if candy then collectCandy(candy) return true end
+	end
+
+	if settings.pinata or settings.zombie then
+		local t, kind = findTarget()
+		if t then fightTarget(t, kind) return true end
+	end
+
+	-- trees wait for the gap since the last one finished (candy / fights still run during the gap)
+	if settings.tree and os.clock() - lastTreeEnd >= C.TREE_GAP then
+		local tree, prompt = nextTree()
+		if tree then doTree(tree, prompt) return true end
+	end
+	return false
+end
+
+task.spawn(function()
+	while true do
+		task.wait()
+		if settings.master and (settings.candy or settings.tree or settings.pinata or settings.zombie) then
+			local ok, res = pcall(step)
+			if not ok then
+				log("ERR", "step() error:", res)
+				task.wait(0.5)
+			elseif res == false then
+				if os.clock() - lastIdleLog > 8 then
+					lastIdleLog = os.clock()
+					log("DBG", "Idle: nothing to do right now")
+				end
+				task.wait(0.12)
+			end
+		else
+			task.wait(0.1)
+		end
+	end
+end)
+
+-- ====================================================================
+-- ====== UI ==========================================================
+-- ====================================================================
+local function addStroke(inst, thickness, mode, color)
+	local s = Instance.new("UIStroke")
+	s.ApplyStrokeMode = mode or Enum.ApplyStrokeMode.Contextual
+	s.Color = color or EDGE
+	s.Thickness = thickness
+	s.Parent = inst
+	return s
+end
+
+local function addCorner(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = inst
+	return c
+end
+
+local function styleText(label, size, color)
+	label.Font = FONT
+	label.TextSize = size
+	label.TextColor3 = color or WHITE
+	addStroke(label, math.max(1.5, size / 9), Enum.ApplyStrokeMode.Contextual)
+end
+
+local function setGradient(frame, top, bottom, name)
+	local g = Instance.new("UIGradient")
+	g.Name = name or "Fill"
+	g.Rotation = 90
+	g.Color = ColorSequence.new(top, bottom)
+	g.Parent = frame
+	return g
+end
+
+local function popScale(obj, from)
+	local s = obj:FindFirstChild("PopScale")
+	if not s then
+		s = Instance.new("UIScale")
+		s.Name = "PopScale"
+		s.Parent = obj
+	end
+	s.Scale = from or 0.6
+	TweenService:Create(s, POP, { Scale = 1 }):Play()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "CandyFarm"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 35
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+-- ---------- bottom left floating hint box (with drifting particles) ----------
+local HINT_BASE = UDim2.new(0, 20, 1, -24)
+
+local hintBox = Instance.new("Frame")
+hintBox.Name = "HintBox"
+hintBox.AnchorPoint = Vector2.new(0, 1)
+hintBox.Position = HINT_BASE
+hintBox.Size = UDim2.fromOffset(270, 76)
+hintBox.BackgroundColor3 = WHITE
+hintBox.BorderSizePixel = 0
+hintBox.ClipsDescendants = true
+hintBox.Parent = gui
+addCorner(hintBox, 16)
+
+local hintBg = Instance.new("UIGradient")
+hintBg.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(46, 6, 14)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(20, 3, 12)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(58, 8, 18)),
+})
+hintBg.Parent = hintBox
+
+local hintStroke = addStroke(hintBox, 2.5, Enum.ApplyStrokeMode.Border, WHITE)
+local hintStrokeGrad = Instance.new("UIGradient")
+hintStrokeGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(120, 10, 25)),
+	ColorSequenceKeypoint.new(0.35, Color3.fromRGB(255, 70, 95)),
+	ColorSequenceKeypoint.new(0.65, Color3.fromRGB(170, 40, 200)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 10, 25)),
+})
+hintStrokeGrad.Parent = hintStroke
+
+local particleLayer = Instance.new("Frame")
+particleLayer.Name = "Particles"
+particleLayer.BackgroundTransparency = 1
+particleLayer.Size = UDim2.fromScale(1, 1)
+particleLayer.ZIndex = 1
+particleLayer.Parent = hintBox
+
+local menuChip = Instance.new("TextLabel")
+menuChip.Position = UDim2.new(0, 16, 0, 9)
+menuChip.Size = UDim2.new(1, -32, 0, 24)
+menuChip.BackgroundTransparency = 1
+menuChip.TextXAlignment = Enum.TextXAlignment.Left
+menuChip.Text = "[" .. C.MENU_KEY.Name .. "] Candy Farm Menu"
+menuChip.ZIndex = 3
+menuChip.Parent = hintBox
+styleText(menuChip, 17, RED_BRIGHT)
+
+local status = Instance.new("TextLabel")
+status.Name = "Status"
+status.Position = UDim2.new(0, 16, 0, 40)
+status.Size = UDim2.new(1, -32, 0, 24)
+status.BackgroundTransparency = 1
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.ZIndex = 3
+status.Parent = hintBox
+styleText(status, 15, SILVER)
+
+-- floating ember particles (pooled + driven every frame so the motion is smooth)
+local PARTICLE_COLORS = {
+	Color3.fromRGB(255, 60, 80),
+	Color3.fromRGB(255, 120, 60),
+	Color3.fromRGB(255, 190, 90),
+	Color3.fromRGB(200, 60, 230),
+	Color3.fromRGB(255, 100, 170),
+	Color3.fromRGB(170, 25, 45),
+}
+local rng = Random.new()
+local fxList = {}
+
+local function makeFX(layer, maxCount, rate, gate)
+	local fx = { layer = layer, pool = {}, live = {}, acc = 0, rate = rate, gate = gate }
+	for _ = 1, maxCount do
+		local p = Instance.new("Frame")
+		p.AnchorPoint = Vector2.new(0.5, 0.5)
+		p.BorderSizePixel = 0
+		p.BackgroundTransparency = 1
+		p.Visible = false
+		p.ZIndex = 2
+		p.Parent = layer
+		addCorner(p, 99)
+		table.insert(fx.pool, p)
+	end
+	table.insert(fxList, fx)
+	return fx
+end
+
+local function updateFX(fx, dt)
+	if fx.gate and not fx.gate() then return end
+	local h = fx.layer.AbsoluteSize.Y
+	if h <= 0 then return end
+
+	fx.acc = math.min(fx.acc + dt * fx.rate, 3)
+	while fx.acc >= 1 and #fx.pool > 0 do
+		fx.acc -= 1
+		local p = table.remove(fx.pool)
+		p.BackgroundColor3 = PARTICLE_COLORS[rng:NextInteger(1, #PARTICLE_COLORS)]
+		p.Visible = true
+		table.insert(fx.live, {
+			f = p,
+			x = rng:NextNumber(0.03, 0.97),
+			speed = rng:NextNumber(h * 0.16, h * 0.42),
+			sway = rng:NextNumber(3, 9),
+			freq = rng:NextNumber(0.8, 1.8),
+			phase = rng:NextNumber(0, 6.28),
+			age = 0,
+			life = rng:NextNumber(3.2, 5.5),
+			size = rng:NextInteger(3, 7),
+			base = rng:NextNumber(0.05, 0.35),
+		})
+	end
+
+	for i = #fx.live, 1, -1 do
+		local s = fx.live[i]
+		s.age += dt
+		local a = s.age / s.life
+		local y = h + 6 - s.speed * s.age
+		if a >= 1 or y < -8 then
+			s.f.Visible = false
+			s.f.BackgroundTransparency = 1
+			table.insert(fx.pool, s.f)
+			table.remove(fx.live, i)
+		else
+			local alpha = math.min(1, a / 0.15, (1 - a) / 0.45)
+			alpha = alpha * alpha * (3 - 2 * alpha) -- smoothstep
+			local k = 0.55 + 0.45 * (1 - a)
+			s.f.Position = UDim2.new(s.x, math.sin(s.age * s.freq * 2 + s.phase) * s.sway, 0, y)
+			s.f.Size = UDim2.fromOffset(s.size * k, s.size * k)
+			s.f.BackgroundTransparency = 1 - alpha * (1 - s.base)
+		end
+	end
+end
+
+makeFX(particleLayer, 30, 14)
+
+-- ---------- main panel ----------
+local panel = Instance.new("CanvasGroup")
+panel.Name = "Panel"
+panel.AnchorPoint = Vector2.new(0.5, 0.5)
+panel.Position = UDim2.fromScale(0.5, 0.5)
+panel.Size = UDim2.fromOffset(410, 560)
+panel.BackgroundTransparency = 1 -- background lives in its own child so it can't tint the contents
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.GroupTransparency = 1
+panel.Parent = gui
+addCorner(panel, 18)
+
+local panelScale = Instance.new("UIScale")
+panelScale.Parent = panel
+
+local panelBgFrame = Instance.new("Frame")
+panelBgFrame.Name = "BgFill"
+panelBgFrame.Size = UDim2.fromScale(1, 1)
+panelBgFrame.BackgroundColor3 = WHITE
+panelBgFrame.BorderSizePixel = 0
+panelBgFrame.ZIndex = 0
+panelBgFrame.Parent = panel
+
+local panelBg = Instance.new("UIGradient")
+panelBg.Name = "Bg"
+panelBg.Rotation = 35
+panelBg.Color = hintBg.Color
+panelBg.Parent = panelBgFrame
+
+local borderStroke = addStroke(panel, 3, Enum.ApplyStrokeMode.Border, WHITE)
+local borderGrad = Instance.new("UIGradient")
+borderGrad.Color = hintStrokeGrad.Color
+borderGrad.Parent = borderStroke
+
+-- particle layer (created first so everything else draws on top of it)
+local panelFxLayer = Instance.new("Frame")
+panelFxLayer.Name = "Particles"
+panelFxLayer.BackgroundTransparency = 1
+panelFxLayer.Size = UDim2.fromScale(1, 1)
+panelFxLayer.ZIndex = 1
+panelFxLayer.Parent = panel
+makeFX(panelFxLayer, 70, 26, function() return panel.Visible end) -- more particles
+
+local titleBar = Instance.new("Frame")
+titleBar.BackgroundTransparency = 1
+titleBar.Size = UDim2.new(1, 0, 0, 64)
+titleBar.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.new(0, 0, 0, 8)
+title.Size = UDim2.new(1, 0, 0, 32)
+title.Text = "CANDY FARM"
+title.Parent = titleBar
+styleText(title, 28, WHITE)
+
+local subtitle = Instance.new("TextLabel")
+subtitle.BackgroundTransparency = 1
+subtitle.Position = UDim2.new(0, 0, 0, 38)
+subtitle.Size = UDim2.new(1, 0, 0, 16)
+subtitle.Text = "halloween auto farm"
+subtitle.Parent = titleBar
+styleText(subtitle, 13, RED_BRIGHT)
+
+local divider = Instance.new("Frame")
+divider.Position = UDim2.new(0, 20, 0, 62)
+divider.Size = UDim2.new(1, -40, 0, 2)
+divider.BackgroundColor3 = WHITE
+divider.BorderSizePixel = 0
+divider.Parent = panel
+local dividerGrad = Instance.new("UIGradient")
+dividerGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, RED_DARK),
+	ColorSequenceKeypoint.new(0.5, RED),
+	ColorSequenceKeypoint.new(1, RED_DARK),
+})
+dividerGrad.Transparency = NumberSequence.new({
+	NumberSequenceKeypoint.new(0, 1),
+	NumberSequenceKeypoint.new(0.5, 0),
+	NumberSequenceKeypoint.new(1, 1),
+})
+dividerGrad.Parent = divider
+
+local content = Instance.new("Frame")
+content.BackgroundTransparency = 1
+content.Position = UDim2.new(0, 18, 0, 72)
+content.Size = UDim2.new(1, -36, 1, -102)
+content.Parent = panel
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 6)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = content
+
+local hint = Instance.new("TextLabel")
+hint.AnchorPoint = Vector2.new(0.5, 1)
+hint.Position = UDim2.new(0.5, 0, 1, -8)
+hint.Size = UDim2.new(1, 0, 0, 18)
+hint.BackgroundTransparency = 1
+hint.Text = "[" .. C.TOGGLE_KEY.Name .. "] Pause   |   [" .. C.MENU_KEY.Name .. "] Close   |   drag the title to move"
+hint.Parent = panel
+styleText(hint, 13, SILVER)
+
+local renderers = {}
+local function renderAll() for _, fn in ipairs(renderers) do fn(true) end end
+
+local order = 0
+local function makeToggle(text, key)
+	order += 1
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 36)
+	row.LayoutOrder = order
+	row.BackgroundColor3 = ROW_OFF
+	row.BorderSizePixel = 0
+	row.BackgroundTransparency = 0.2 -- slightly see-through so particles show behind the rows
+	row.Parent = content
+	addCorner(row, 10)
+	local rowStroke = addStroke(row, 2, Enum.ApplyStrokeMode.Border, EDGE)
+	setGradient(row, WHITE, Color3.fromRGB(150, 150, 150))
+
+	local name = Instance.new("TextLabel")
+	name.BackgroundTransparency = 1
+	name.Position = UDim2.new(0, 14, 0, 0)
+	name.Size = UDim2.new(1, -90, 1, 0)
+	name.TextXAlignment = Enum.TextXAlignment.Left
+	name.Text = text
+	name.Parent = row
+	styleText(name, 17)
+
+	local sw = Instance.new("Frame")
+	sw.AnchorPoint = Vector2.new(1, 0.5)
+	sw.Position = UDim2.new(1, -12, 0.5, 0)
+	sw.Size = UDim2.fromOffset(48, 22)
+	sw.BackgroundColor3 = SW_OFF
+	sw.BorderSizePixel = 0
+	sw.Parent = row
+	addCorner(sw, 11)
+	addStroke(sw, 2, Enum.ApplyStrokeMode.Border, EDGE)
+
+	local knob = Instance.new("Frame")
+	knob.AnchorPoint = Vector2.new(0, 0.5)
+	knob.Position = UDim2.new(0, 3, 0.5, 0)
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.BackgroundColor3 = WHITE
+	knob.BorderSizePixel = 0
+	knob.Parent = sw
+	addCorner(knob, 8)
+
+	local btn = Instance.new("TextButton")
+	btn.BackgroundTransparency = 1
+	btn.Text = ""
+	btn.Size = UDim2.fromScale(1, 1)
+	btn.ZIndex = 5
+	btn.Parent = row
+
+	local function render(instant)
+		local on = settings[key]
+		local info = instant and TweenInfo.new(0) or POP
+		TweenService:Create(knob, info, { Position = on and UDim2.new(1, -19, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }):Play()
+		TweenService:Create(sw, FAST, { BackgroundColor3 = on and SW_ON or SW_OFF }):Play()
+		TweenService:Create(row, FAST, { BackgroundColor3 = on and ROW_ON or ROW_OFF }):Play()
+	end
+	table.insert(renderers, render)
+
+	btn.MouseEnter:Connect(function() TweenService:Create(rowStroke, FAST, { Color = RED }):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(rowStroke, FAST, { Color = EDGE }):Play() end)
+	btn.Activated:Connect(function()
+		settings[key] = not settings[key]
+		render(false)
+		popScale(row, 0.96)
+		log("INFO", "Toggle '" .. text .. "' ->", settings[key] and "ON" or "OFF")
+	end)
+	render(true)
+end
+
+makeToggle("Auto Teleport to Candy", "candy")
+makeToggle("Auto Trick or Treat", "tree")
+makeToggle("Auto Pinata", "pinata")
+makeToggle("Auto Zombie", "zombie")
+makeToggle("Farm Running (pause = N)", "master")
+makeToggle("Verbose logs", "verbose")
+
+-- stat chips
+order += 1
+local statsRow = Instance.new("Frame")
+statsRow.BackgroundTransparency = 1
+statsRow.Size = UDim2.new(1, 0, 0, 48)
+statsRow.LayoutOrder = order
+statsRow.Parent = content
+local grid = Instance.new("UIGridLayout")
+grid.CellSize = UDim2.new(0.25, -6, 1, 0)
+grid.CellPadding = UDim2.fromOffset(8, 0)
+grid.SortOrder = Enum.SortOrder.LayoutOrder
+grid.Parent = statsRow
+
+local chipLabels, chipLast = {}, {}
+local function makeChip(labelText, key, idx)
+	local chip = Instance.new("Frame")
+	chip.LayoutOrder = idx
+	chip.BackgroundColor3 = Color3.fromRGB(24, 6, 11)
+	chip.BorderSizePixel = 0
+	chip.Parent = statsRow
+	addCorner(chip, 10)
+	addStroke(chip, 2, Enum.ApplyStrokeMode.Border, RED_DARK)
+
+	local num = Instance.new("TextLabel")
+	num.BackgroundTransparency = 1
+	num.Position = UDim2.new(0, 0, 0, 3)
+	num.Size = UDim2.new(1, 0, 0, 24)
+	num.Text = "0"
+	num.Parent = chip
+	styleText(num, 21, WHITE)
+
+	local cap = Instance.new("TextLabel")
+	cap.BackgroundTransparency = 1
+	cap.Position = UDim2.new(0, 0, 0, 27)
+	cap.Size = UDim2.new(1, 0, 0, 16)
+	cap.Text = labelText
+	cap.Parent = chip
+	styleText(cap, 12, RED_BRIGHT)
+
+	chipLabels[key] = { num = num, chip = chip }
+	chipLast[key] = 0
+end
+makeChip("CANDY", "candy", 1)
+makeChip("TREES", "trees", 2)
+makeChip("PINATAS", "pinatas", 3)
+makeChip("ZOMBIES", "zombies", 4)
+
+-- live log box
+order += 1
+local logBox = Instance.new("Frame")
+logBox.LayoutOrder = order
+logBox.Size = UDim2.new(1, 0, 0, 132)
+logBox.BackgroundColor3 = Color3.fromRGB(8, 2, 4)
+logBox.BorderSizePixel = 0
+logBox.Parent = content
+addCorner(logBox, 10)
+addStroke(logBox, 2, Enum.ApplyStrokeMode.Border, RED_DARK)
+
+local logScroll = Instance.new("ScrollingFrame")
+logScroll.BackgroundTransparency = 1
+logScroll.BorderSizePixel = 0
+logScroll.Position = UDim2.new(0, 8, 0, 6)
+logScroll.Size = UDim2.new(1, -16, 1, -12)
+logScroll.ScrollBarThickness = 4
+logScroll.ScrollBarImageColor3 = RED
+logScroll.CanvasSize = UDim2.new()
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logScroll.Parent = logBox
+local logList = Instance.new("UIListLayout")
+logList.SortOrder = Enum.SortOrder.LayoutOrder
+logList.Padding = UDim.new(0, 1)
+logList.Parent = logScroll
+
+local logLabels, logCount = {}, 0
+local function addLogLine(entry)
+	logCount += 1
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.LayoutOrder = logCount
+	l.Size = UDim2.new(1, -6, 0, 0)
+	l.AutomaticSize = Enum.AutomaticSize.Y
+	l.TextWrapped = true
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 12
+	l.TextColor3 = LEVEL_COLORS[entry.level] or WHITE
+	l.Text = string.format("%6.1f  %s", entry.t, entry.msg)
+	l.TextTransparency = 1
+	l.Parent = logScroll
+	TweenService:Create(l, FAST, { TextTransparency = 0 }):Play()
+	table.insert(logLabels, l)
+	if #logLabels > 80 then
+		local old = table.remove(logLabels, 1)
+		old:Destroy()
+	end
+	task.defer(function()
+		logScroll.CanvasPosition = Vector2.new(0, math.max(0, logScroll.AbsoluteCanvasSize.Y - logScroll.AbsoluteWindowSize.Y))
+	end)
+end
+
+for _, e in ipairs(history) do addLogLine(e) end
+uiAdd = addLogLine
+
+-- drag (eased, so it glides instead of snapping to the cursor)
+local panelPos = Vector2.zero    -- current offset from screen center (px)
+local panelTarget = Vector2.zero -- where the drag wants it to be
+
+local function clampPanel(v)
+	local vs = gui.AbsoluteSize
+	local half = Vector2.new(205, 280)
+	-- keep the title bar reachable so it can never get lost off-screen
+	local minX, maxX = -(vs.X / 2 + half.X - 100), (vs.X / 2 + half.X - 100)
+	local minY, maxY = half.Y - vs.Y / 2, vs.Y / 2 - 64 + half.Y
+	return Vector2.new(math.clamp(v.X, minX, maxX), math.clamp(v.Y, minY, maxY))
+end
+
+do
+	local dragging, dragInput, dragStart, startTarget = false, nil, nil, nil
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragInput = input
+			dragStart = Vector2.new(input.Position.X, input.Position.Y)
+			startTarget = panelTarget
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input == dragInput then
+			local d = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+			panelTarget = clampPanel(startTarget + d)
+		end
+	end)
+	UIS.InputEnded:Connect(function(input)
+		if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end)
+end
+
+-- menu open / close
+local menuOpen = false
+local saved = nil
+
+local function setMenu(open)
+	if open == menuOpen then return end
+	menuOpen = open
+	if open then
+		saved = { behavior = UIS.MouseBehavior, icon = UIS.MouseIconEnabled }
+		local ps = player:FindFirstChild("PlayerScripts")
+		local fp = ps and ps:FindFirstChild("FirstPersonCamera")
+		if fp and fp:IsA("LocalScript") and not fp.Disabled then
+			saved.fp = fp
+			fp.Disabled = true
+		end
+		pcall(function() RunService:UnbindFromRenderStep("CandyFarmMouse") end)
+		RunService:BindToRenderStep("CandyFarmMouse", Enum.RenderPriority.Camera.Value + 10, function()
+			UIS.MouseBehavior = Enum.MouseBehavior.Default
+			UIS.MouseIconEnabled = true
+		end)
+		panel.Visible = true
+		panel.GroupTransparency = 1
+		panelScale.Scale = 0.82
+		TweenService:Create(panel, TweenInfo.new(0.25, Enum.EasingStyle.Quad), { GroupTransparency = 0 }):Play()
+		TweenService:Create(panelScale, POP, { Scale = 1 }):Play()
+		renderAll()
+	else
+		pcall(function() RunService:UnbindFromRenderStep("CandyFarmMouse") end)
+		if saved then
+			if saved.fp then saved.fp.Disabled = false end
+			UIS.MouseBehavior = saved.behavior
+			UIS.MouseIconEnabled = saved.icon
+			saved = nil
+		end
+		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { GroupTransparency = 1 }):Play()
+		TweenService:Create(panelScale, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Scale = 0.9 }):Play()
+		task.delay(0.22, function()
+			if not menuOpen then panel.Visible = false end
+		end)
+	end
+end
+
+local function updateStatus()
+	local anyOn = settings.candy or settings.tree or settings.pinata or settings.zombie
+	if not settings.master then
+		status.Text = "[" .. C.TOGGLE_KEY.Name .. "] Farm: PAUSED"
+		status.TextColor3 = SILVER
+	elseif anyOn then
+		status.Text = "[" .. C.TOGGLE_KEY.Name .. "] Farm: RUNNING"
+		status.TextColor3 = Color3.fromRGB(255, 110, 125)
+	else
+		status.Text = "[" .. C.TOGGLE_KEY.Name .. "] Farm: ON (nothing enabled)"
+		status.TextColor3 = SILVER
+	end
+end
+
+-- keep the status text in sync when toggles are clicked in the menu
+task.spawn(function()
+	while gui.Parent do
+		updateStatus()
+		task.wait(0.25)
+	end
+end)
+
+RunService.RenderStepped:Connect(function(dt)
+	local t = os.clock()
+	dt = math.min(dt, 0.1)
+
+	-- main panel: NO floating, just smooth drag easing + animated border/background
+	if panel.Visible then
+		local a = 1 - math.exp(-dt * 22) -- frame-rate independent easing
+		panelPos = panelPos:Lerp(panelTarget, a)
+		if (panelPos - panelTarget).Magnitude < 0.05 then panelPos = panelTarget end
+		panel.Position = UDim2.new(0.5, panelPos.X, 0.5, panelPos.Y)
+
+		borderGrad.Rotation = (t * 60) % 360
+		panelBg.Offset = Vector2.new(math.sin(t * 0.8) * 0.25, 0)
+		subtitle.TextColor3 = RED_BRIGHT:Lerp(Color3.fromRGB(255, 200, 215), (math.sin(t * 2.2) + 1) / 2)
+	end
+
+	for _, fx in ipairs(fxList) do updateFX(fx, dt) end
+
+	-- only the keybind hint box floats: one slow sine so the motion is even
+	local bob = math.sin(t * 1.5) * 4
+	hintBox.Position = HINT_BASE + UDim2.fromOffset(0, bob)
+	hintStrokeGrad.Rotation = (t * 60) % 360
+	hintBg.Offset = Vector2.new(math.sin(t * 0.8) * 0.25, 0)
+	menuChip.TextColor3 = RED_BRIGHT:Lerp(Color3.fromRGB(255, 200, 215), (math.sin(t * 2.2) + 1) / 2)
+
+	for key, data in pairs(chipLabels) do
+		local v = stats[key]
+		if v ~= chipLast[key] then
+			chipLast[key] = v
+			data.num.Text = tostring(v)
+			popScale(data.chip, 0.8)
+		end
+	end
+end)
+
+-- ====================================================================
+-- ====== INPUT / EVENTS ==============================================
+-- ====================================================================
+UIS.InputBegan:Connect(function(input)
+	if UIS:GetFocusedTextBox() then return end
+	if input.KeyCode == C.TOGGLE_KEY then
+		settings.master = not settings.master
+		log("INFO", "Farm", settings.master and "RESUMED" or "PAUSED")
+		renderAll()
+		updateStatus()
+		popScale(status, 0.8)
+	elseif input.KeyCode == C.MENU_KEY then
+		setMenu(not menuOpen)
+	end
+end)
+
+local function hookCharacter(char)
+	log("INFO", "Character spawned:", char.Name)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if hum then
+		hum.Died:Connect(function() log("WARN", "You died - farm idles until you respawn") end)
+		hum.StateChanged:Connect(function(_, new)
+			log("DBG", "Humanoid state ->", new.Name)
+		end)
+	end
+end
+player.CharacterAdded:Connect(hookCharacter)
+if player.Character then task.spawn(hookCharacter, player.Character) end
+
+task.spawn(function()
+	local f = Workspace:WaitForChild(C.CANDY_FOLDER, 20)
+	if f then
+		hookCandyFolder(f)
+	else
+		log("WARN", "Folder Workspace." .. C.CANDY_FOLDER .. " not found after 20s - candy events won't be logged (still checked every frame)")
+	end
+end)
+
+task.spawn(function()
+	log("INFO", "CandyFarm loaded. [" .. C.TOGGLE_KEY.Name .. "] pause, [" .. C.MENU_KEY.Name .. "] menu")
+	task.wait(1.5)
+	for _, name in ipairs({ C.CANDY_FOLDER, C.TREE_FOLDER, C.LIVE_FOLDER }) do
+		local f = Workspace:FindFirstChild(name)
+		if f then
+			log("OK", "Found Workspace." .. name .. " (" .. #f:GetChildren() .. " children)")
+		else
+			log("WARN", "Workspace." .. name .. " NOT FOUND (check spelling in CONFIG)")
+		end
+	end
+	local cf = Workspace:FindFirstChild(C.CANDY_FOLDER)
+	if cf then
+		local first = cf:FindFirstChild(C.CANDY_NAME)
+		if first then dumpCandy(first) end
+		scanCandy()
+	end
+	log("INFO", "VirtualInputManager:", VIM and "available" or "unavailable",
+		"| mouse1click:", ext_mouse1click and "available" or "unavailable",
+		"| firetouchinterest:", ext_firetouch and "available" or "unavailable")
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(C.STATUS_LOG_INTERVAL)
+		if settings.master and (settings.candy or settings.tree or settings.pinata or settings.zombie) then
+			local c, h = getChar()
+			local why = c and ragdollReason(c, h) or "no character"
+			local cf = Workspace:FindFirstChild(C.CANDY_FOLDER)
+			log("INFO", string.format("STATUS candy=%d trees=%d pinatas=%d zombies=%d | candyOnMap=%s | blocked=%s",
+				stats.candy, stats.trees, stats.pinatas, stats.zombies,
+				cf and tostring(#cf:GetChildren()) or "no folder", tostring(why)))
+		end
+	end
+end)
+
+updateStatus()
+renderAll()
